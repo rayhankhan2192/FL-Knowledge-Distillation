@@ -51,9 +51,6 @@ def _set_runtime_knobs(num_threads: int = 4) -> None:
     except Exception:
         pass
 
-# =============================================================================
-# NEW XAI FUNCTIONS (FROM train_eval.py)
-# =============================================================================
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
