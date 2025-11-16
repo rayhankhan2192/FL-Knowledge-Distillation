@@ -22,14 +22,14 @@ from collections import OrderedDict
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F  # NEW IMPORT
+import torch.nn.functional as F
 import flwr as fl
 import grpc
 import cv2
-import matplotlib.pyplot as plt  # NEW IMPORT
+import matplotlib.pyplot as plt
 
 from utils.label_focalLoss import FocalLoss, LabelSmoothingLoss
-from utils.dataloder import create_data_loaders, get_class_weights  # (spelling kept)
+from utils.dataloder import create_data_loaders, get_class_weights
 from utils.evaluation import ModelTrainer, ModelMetrics
 from models.modelEngine import get_model
 
@@ -39,10 +39,9 @@ logger = logging.getLogger(__name__)
 RESULTS_BASE_DIR = os.path.abspath(os.path.join("Result", "clientresult"))
 os.makedirs(RESULTS_BASE_DIR, exist_ok=True)
 
+
 def _set_runtime_knobs(num_threads: int = 4) -> None:
-    """
-    Configure CPU threads to reduce contention on CPU-only boxes.
-    """
+    """Configure CPU threads to reduce contention on CPU-only boxes."""
     os.environ.setdefault("OMP_NUM_THREADS", str(num_threads))
     os.environ.setdefault("MKL_NUM_THREADS", str(num_threads))
     try:
@@ -56,14 +55,12 @@ def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
-def find_last_conv_layer(model: torch.nn.Module):
+def find_last_conv_layer(model: torch.nn.Module) -> Optional[torch.nn.Module]:
     """Return the last nn.Conv2d layer in the model, or None if not found."""
     last_conv = None
     for module in model.modules():
         if isinstance(module, torch.nn.Conv2d):
             last_conv = module
-    if last_conv is None:
-        logger.warning("No Conv2d layer found for Grad-CAM++; XAI will be skipped.")
     return last_conv
 
 
@@ -71,7 +68,7 @@ def compute_gradcam_pp(
     model: torch.nn.Module,
     x: torch.Tensor,
     target_layer: torch.nn.Module,
-    class_idx: int = None,
+    class_idx: Optional[int] = None,
 ) -> np.ndarray:
     """
     Compute Grad-CAM++ heatmap for a single image batch x (shape [1, C, H, W]).
@@ -81,50 +78,53 @@ def compute_gradcam_pp(
     gradients: List[torch.Tensor] = []
 
     def forward_hook(module, inp, out):
-        activations.append(out)
+        activations.append(out.detach())
 
     def backward_hook(module, grad_in, grad_out):
-        gradients.append(grad_out[0])
+        gradients.append(grad_out[0].detach())
 
     handle_f = target_layer.register_forward_hook(forward_hook)
-    handle_b = target_layer.register_backward_hook(backward_hook)
+    handle_b = target_layer.register_full_backward_hook(backward_hook)
 
-    model.zero_grad()
-    logits = model(x)
-    if class_idx is None:
-        class_idx = int(torch.argmax(logits, dim=1).item())
-    score = logits[:, class_idx]
-    
-    # Use enable_grad context for backward pass
-    with torch.enable_grad():
+    try:
+        model.zero_grad(set_to_none=True)
+        
+        logits = model(x)
+        if class_idx is None:
+            class_idx = int(torch.argmax(logits, dim=1).item())
+        
+        score = logits[:, class_idx]
         score.backward(retain_graph=False)
 
-    A = activations[0]  # [B, C, H, W]
-    G = gradients[0]    # [B, C, H, W]
+        if not activations or not gradients:
+            raise RuntimeError("Hooks not triggered - check target_layer")
+        
+        A = activations[0][0]  # [C, H, W]
+        G = gradients[0][0]    # [C, H, W]
 
-    A = A[0]  # [C, H, W]
-    G = G[0]  # [C, H, W]
+        grads2 = G ** 2
+        grads3 = G ** 3
+        sum_activations = torch.sum(A, dim=(1, 2), keepdim=True)
 
-    grads2 = G ** 2
-    grads3 = G ** 3
-    sum_activations = torch.sum(A, dim=(1, 2), keepdim=True)  # [C, 1, 1]
+        eps = 1e-7
+        alpha = grads2 / (2 * grads2 + sum_activations * grads3 + eps)
+        positive_gradients = F.relu(G)
+        weights = torch.sum(alpha * positive_gradients, dim=(1, 2))
 
-    eps = 1e-7
-    alpha = grads2 / (2 * grads2 + sum_activations * grads3 + eps)  # [C, H, W]
-    positive_gradients = F.relu(G)  # [C, H, W]
-    weights = torch.sum(alpha * positive_gradients, dim=(1, 2))  # [C]
+        cam = torch.sum(weights.view(-1, 1, 1) * A, dim=0)
+        cam = F.relu(cam)
 
-    cam = torch.sum(weights.view(-1, 1, 1) * A, dim=0)  # [H, W]
-    cam = F.relu(cam)
-
-    cam_np = cam.detach().cpu().numpy()
-    cam_np = cam_np - cam_np.min()
-    if cam_np.max() > 0:
-        cam_np = cam_np / cam_np.max()
-
-    handle_f.remove()
-    handle_b.remove()
-    return cam_np
+        cam_np = cam.detach().cpu().numpy()
+        cam_np = cam_np - cam_np.min()
+        if cam_np.max() > 0:
+            cam_np = cam_np / cam_np.max()
+        
+        return cam_np
+        
+    finally:
+        handle_f.remove()
+        handle_b.remove()
+        model.zero_grad(set_to_none=True)
 
 
 def compute_deletion_auc(
@@ -137,52 +137,50 @@ def compute_deletion_auc(
 ) -> float:
     """
     Deletion AUC faithfulness metric.
-    Iteratively removes the most important pixels according to cam and tracks
-    the predicted probability for class_idx. Returns the AUC over fraction deleted.
+    Lower values = better faithfulness (rapid confidence drop).
+    Expected range: 0.1-0.3 (good), 0.5-0.7 (moderate), >0.7 (poor).
     """
     model.eval()
+    
     with torch.no_grad():
-        x_mod = x.clone().to(device)  # [1, C, H, W]
-        _, _, H, W = x_mod.shape
-
+        x_mod = x.clone().to(device)
+        B, C, H, W = x_mod.shape
+        
+        if cam.shape != (H, W):
+            cam = cv2.resize(cam, (W, H))
+        
         cam_flat = cam.reshape(-1)
-        indices = np.argsort(-cam_flat)  # high to low
+        indices = np.argsort(-cam_flat)
+        
         num_pixels = H * W
         pixels_per_step = max(num_pixels // steps, 1)
-
+        
+        mask = torch.ones((1, 1, H, W), device=device, dtype=x_mod.dtype)
         scores: List[float] = []
-        mask = torch.ones((1, 1, H, W), device=device) # Assumes 1-channel mask
-
-        for i in range(steps + 1):
-            # Apply mask. Ensure mask works for multi-channel images if needed.
-            # If x_mod is [1, C, H, W], mask should be broadcastable.
-            if x_mod.size(1) == 3: # Handle 3-channel input
-                 masked_input = x_mod * mask.expand(-1, 3, -1, -1)
-            else: # Handle 1-channel input
-                 masked_input = x_mod * mask
-
+        
+        for step_i in range(steps + 1):
+            masked_input = x_mod * mask
+            
             logits = model(masked_input)
             probs = F.softmax(logits, dim=1)
-            scores.append(float(probs[0, class_idx].item()))
-
-            if i == steps:
+            score = float(probs[0, class_idx].item())
+            scores.append(score)
+            
+            if step_i == steps:
                 break
-
-            start = i * pixels_per_step
-            end = (i + 1) * pixels_per_step
-            end = min(end, num_pixels)
-            idx = indices[start:end]
-
-            flat_mask = mask.view(-1)
-            # 0-out the selected pixels
-            rows = idx // W
-            cols = idx % W
-            flat_mask[idx] = 0.0
-            mask = flat_mask.view(1, 1, H, W)
-
-
+            
+            start_idx = step_i * pixels_per_step
+            end_idx = min((step_i + 1) * pixels_per_step, num_pixels)
+            pixels_to_delete = indices[start_idx:end_idx]
+            
+            for pixel_idx in pixels_to_delete:
+                row = int(pixel_idx // W)
+                col = int(pixel_idx % W)
+                mask[0, 0, row, col] = 0.0
+        
         fractions = np.linspace(0.0, 1.0, len(scores))
         auc = float(np.trapz(scores, fractions))
+        
         return auc
 
 
@@ -194,56 +192,68 @@ def save_gradcam_overlay(
     idx: int,
     true_label: int,
     pred_label: int,
+    auc: Optional[float] = None,
 ) -> None:
-    """
-    Save an overlay of Grad-CAM++ heatmap on top of the input image.
-    x: [1, C, H, W] tensor on device.
-    """
+    """Save an overlay of Grad-CAM++ heatmap on top of the input image."""
     _ensure_dir(out_dir)
 
     img = x[0].detach().cpu()
-    # Handle both 1-channel (C=1) and 3-channel (C=3)
+    
     if img.shape[0] == 1:
-        base = img[0].numpy() # [H, W]
+        base = img[0].numpy()
+        is_grayscale = True
     else:
-        base = img.permute(1, 2, 0).numpy() # [H, W, C]
+        base = img.permute(1, 2, 0).numpy()
+        is_grayscale = False
 
-    # Normalize base image to [0,1] for display
     base = base - base.min()
     if base.max() > 0:
         base = base / (base.max() + 1e-8)
 
-    # Resize CAM to match image dimensions
     cam_resized = cv2.resize(cam, (base.shape[1], base.shape[0]))
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
     
-    cam_norm = cam_resized
-    cam_norm = cam_norm - cam_norm.min()
-    if cam_norm.max() > 0:
-        cam_norm = cam_norm / (cam_norm.max() + 1e-8)
+    if is_grayscale:
+        axes[0].imshow(base, cmap="gray")
+    else:
+        axes[0].imshow(base)
+    axes[0].set_title("Original")
+    axes[0].axis("off")
+    
+    axes[1].imshow(cam_resized, cmap="jet")
+    axes[1].set_title("Grad-CAM++")
+    axes[1].axis("off")
+    
+    if is_grayscale:
+        axes[2].imshow(base, cmap="gray")
+    else:
+        axes[2].imshow(base)
+    axes[2].imshow(cam_resized, cmap="jet", alpha=0.5)
+    
+    match_symbol = "✓" if pred_label == true_label else "✗"
+    title = f"Overlay {match_symbol}\nTrue: {true_label}, Pred: {pred_label}"
+    if auc is not None:
+        title += f"\nDel-AUC: {auc:.4f}"
+    axes[2].set_title(title)
+    axes[2].axis("off")
 
-    plt.figure(figsize=(4, 4))
-    if base.ndim == 2: # Grayscale
-        plt.imshow(base, cmap="gray")
-    else: # RGB
-        plt.imshow(base)
-    plt.imshow(cam_norm, cmap="jet", alpha=0.5)
-    plt.axis("off")
-
-    fname = f"round{round_num}_idx{idx}_true{true_label}_pred{pred_label}.png"
+    plt.tight_layout()
+    
+    fname = f"round{round_num:03d}_sample{idx:03d}_true{true_label}_pred{pred_label}"
+    if auc is not None:
+        fname += f"_auc{auc:.3f}"
+    fname += ".png"
+    
     save_path = os.path.join(out_dir, fname)
-    plt.savefig(save_path, bbox_inches="tight", pad_inches=0.0)
-    plt.close()
-
-# =============================================================================
-# END OF NEW XAI FUNCTIONS
-# =============================================================================
+    plt.savefig(save_path, bbox_inches="tight", dpi=150)
+    plt.close(fig)
 
 
 # Flower Client
 class MedicalFLClient(fl.client.NumPyClient):
-    """
-    Federated Learning client for medical image classification (PyTorch).
-    """
+    """Federated Learning client for medical image classification (PyTorch)."""
+    
     def __init__(
         self,
         client_id: int,
@@ -253,7 +263,7 @@ class MedicalFLClient(fl.client.NumPyClient):
         num_classes: int = 4,
         batch_size: int = 16,
         local_epochs: int = 8,
-        num_workers: int = 4,
+        num_workers: int = 1,
         results_base_dir: str = RESULTS_BASE_DIR,
     ):
         self.client_id = client_id
@@ -263,7 +273,7 @@ class MedicalFLClient(fl.client.NumPyClient):
         self.batch_size = batch_size
         self.local_epochs = local_epochs
         self.num_workers = num_workers
-        self.current_round = 0 # Track current FL round
+        self.current_round = 0  # Track current FL round
 
         # Per-client folders
         self.results_base_dir = results_base_dir
@@ -281,10 +291,9 @@ class MedicalFLClient(fl.client.NumPyClient):
         self.model = get_model(model_name, num_classes, pretrained=True)
         self.model.to(device)
 
-        # *** MODIFIED: Use new function ***
         self.target_layer = find_last_conv_layer(self.model)
         if self.target_layer is None:
-            logger.warning("No Conv2d layer found for Grad-CAM. XAI probe will be skipped.")
+            logger.warning("No Conv2d layer found for Grad-CAM++. XAI probe will be skipped.")
 
         logger.info(f"Client {client_id}: Loading data from {data_dir}")
         ctx = mp.get_context("spawn")
@@ -328,10 +337,6 @@ class MedicalFLClient(fl.client.NumPyClient):
         num_workers: int,
         multiprocessing_context,
     ):
-        """
-        Try to pass 'multiprocessing_context' to your create_data_loaders if supported.
-        If not, fall back without it (still fine if mp.set_start_method('spawn') is set).
-        """
         try:
             loaders = create_data_loaders(
                 data_dir=data_dir,
@@ -341,12 +346,12 @@ class MedicalFLClient(fl.client.NumPyClient):
                 test_split=test_split,
                 image_size=image_size,
                 num_workers=num_workers,
-                multiprocessing_context=multiprocessing_context, 
+                multiprocessing_context=multiprocessing_context,
             )
             return loaders
         except TypeError:
             logger.warning("utils.dataloder.create_data_loaders does not accept 'multiprocessing_context'; "
-                           "falling back without it. Make sure mp.set_start_method('spawn') is set in main().")
+                           "falling back without it.")
             loaders = create_data_loaders(
                 data_dir=data_dir,
                 batch_size=batch_size,
@@ -358,7 +363,6 @@ class MedicalFLClient(fl.client.NumPyClient):
             )
             return loaders
 
-    # Flower NumPyClient API ----
     def get_parameters(self, config: Dict = None) -> List[np.ndarray]:
         return [p.detach().cpu().numpy() for p in self.model.state_dict().values()]
 
@@ -376,8 +380,9 @@ class MedicalFLClient(fl.client.NumPyClient):
         logger.info(f"Client {self.client_id}: Starting local training round")
         self.set_parameters(parameters)
 
-        # Server-configurable knobs
-        self.current_round = int(config.get("server_round", 0)) # Store current round
+        # Extract and store current round
+        self.current_round = int(config.get("server_round", 0))
+        
         local_epochs   = int(config.get("local_epochs", self.local_epochs))
         learning_rate  = float(config.get("learning_rate", self.learning_rate))
         weight_decay   = float(config.get("weight_decay", self.weight_decay))
@@ -386,7 +391,6 @@ class MedicalFLClient(fl.client.NumPyClient):
         scheduler_name = str(config.get("scheduler", "plateau")).lower()
         use_scheduler  = bool(config.get("use_scheduler", True))
 
-        # Loss
         if loss_function == "focal":
             criterion = FocalLoss(alpha=1.0, gamma=2.0)
         elif loss_function == "label_smoothing":
@@ -394,7 +398,6 @@ class MedicalFLClient(fl.client.NumPyClient):
         else:
             criterion = nn.CrossEntropyLoss(weight=self.class_weights.to(self.device))
 
-        # Train
         train_history = self.trainer.train(
             train_loader=self.train_loader,
             val_loader=self.val_loader,
@@ -409,56 +412,68 @@ class MedicalFLClient(fl.client.NumPyClient):
             scheduler_name=scheduler_name,
         )
 
-        # Evaluate on test
         test_metrics = self.trainer.evaluate(self.test_loader)
 
-        # XAI probe (optional)
+        # XAI probe with proper epoch parameter
         xai_metrics = self._xai_probe(
-            loader=self.val_loader, 
-            num_samples=16, 
-            save_k=3, 
-            epoch=self.current_round
-        )
+            loader=self.val_loader,
+            num_samples=16,
+            save_k=3,
+            epoch=self.current_round 
+        ) if self.target_layer else {
+            "xai_del_auc_mean": float("nan"),
+            "xai_del_auc_std": float("nan")
+        }
 
-        # Save checkpoint
         best_model_path = os.path.join(self.ckpt_dir, f"client_{self.client_id}_best_model.pth")
         torch.save(self.model.state_dict(), best_model_path)
         logger.info(f"Client {self.client_id}: Best model saved to {best_model_path}")
 
-        # Scalar metrics only (keep payload small)
         metrics = {
             "train_loss": float(train_history["train_loss"][-1]),
             "train_accuracy": float(train_history["train_accuracy"][-1]),
             "val_loss": float(train_history["val_loss"][-1]),
             "val_accuracy": float(train_history["val_accuracy"][-1]),
             "val_f1": float(train_history["val_f1_macro"][-1]),
+            "train_auc_roc_macro": float(train_history.get("train_auc_roc_macro", [0.0])[-1]),
+            "val_auc_roc_macro": float(train_history.get("val_auc_roc_macro", [0.0])[-1]),
             "test_accuracy": float(test_metrics["accuracy"]),
             "test_f1": float(test_metrics["f1_macro"]),
             "num_examples": int(len(self.train_loader.dataset)),
-            **xai_metrics, # Add val_del_auc_mean and val_del_auc_std
+            **xai_metrics,
         }
 
         logger.info(f"Client {self.client_id}: Local training completed")
+        logger.info(f"  XAI Deletion AUC: {metrics.get('xai_del_auc_mean', 'N/A')}")
+        
         return self.get_parameters(), len(self.train_loader.dataset), metrics
 
     def evaluate(self, parameters: List[np.ndarray], config: Dict) -> Tuple[float, int, Dict]:
         logger.info(f"Client {self.client_id}: Starting evaluation")
         self.set_parameters(parameters)
+        
+        # Extract current round
         self.current_round = int(config.get("server_round", 0))
 
         test_metrics = self.trainer.evaluate(self.test_loader)
+        
+        # XAI probe with proper epoch parameter
         add_xai = self._xai_probe(
-            loader=self.val_loader, 
-            num_samples=12, 
+            loader=self.val_loader,
+            num_samples=12,
             save_k=0,
-            epoch=self.current_round
-        )
+            epoch=self.current_round 
+        ) if self.target_layer else {
+            "xai_del_auc_mean": float("nan"),
+            "xai_del_auc_std": float("nan")
+        }
+        
         test_metrics.update(add_xai)
 
         logger.info(f"Client {self.client_id}: Evaluation completed")
         logger.info(f"  - Test Accuracy: {test_metrics['accuracy']:.4f}")
         logger.info(f"  - Test F1 (Macro): {test_metrics['f1_macro']:.4f}")
-        logger.info(f"  - XAI Deletion AUC: {add_xai['val_del_auc_mean']:.4f}")
+        logger.info(f"  - XAI Deletion AUC: {add_xai.get('xai_del_auc_mean', 'N/A')}")
 
         return (
             float(test_metrics.get("loss", 0.0)),
@@ -466,24 +481,28 @@ class MedicalFLClient(fl.client.NumPyClient):
             {k: (float(v) if isinstance(v, (int, float, np.floating)) else v) for k, v in test_metrics.items()},
         )
 
-    # *** MODIFIED: Rewritten _xai_probe function ***
     def _xai_probe(self, loader, num_samples: int = 16, save_k: int = 3, epoch: int = 0) -> Dict[str, float]:
         """
-        Run a Grad-CAM++ + Deletion AUC probe on a subset of the validation set.
+        Run Grad-CAM++ + Deletion AUC probe on validation set.
+        
         Returns:
-            {"val_del_auc_mean": ..., "val_del_auc_std": ...}
+            Dictionary with XAI metrics:
+            - "xai_del_auc_mean": Mean deletion AUC (lower = better)
+            - "xai_del_auc_std": Standard deviation of deletion AUC
         """
         if self.target_layer is None:
             logger.warning("No target_layer found, skipping XAI probe.")
-            return {"val_del_auc_mean": float("nan"), "val_del_auc_std": float("nan")}
+            return {
+                "xai_del_auc_mean": float("nan"),
+                "xai_del_auc_std": float("nan")
+            }
 
         self.model.eval()
         del_aucs: List[float] = []
         seen = 0
         saved = 0
 
-        # Use the xai_dir defined in __init__
-        _ensure_dir(self.xai_dir) 
+        _ensure_dir(self.xai_dir)
 
         for images, labels in loader:
             images = images.to(self.device)
@@ -494,65 +513,110 @@ class MedicalFLClient(fl.client.NumPyClient):
                 if seen >= num_samples:
                     break
 
-                x = images[i:i+1] # [1, C, H, W]
+                x = images[i:i+1]  # [1, C, H, W]
                 y_true = int(labels[i].item())
 
+                # Get prediction (without gradients)
                 with torch.no_grad():
                     logits = self.model(x)
                     pred_idx = int(torch.argmax(logits, dim=1).item())
 
-                # Use the true label for the test
-                class_idx = y_true
+                # Use predicted class for CAM
+                class_idx = pred_idx
 
-                # 1. Grad-CAM++ heatmap
-                # We need to enable grad for CAM calculation
-                x.requires_grad_(True)
-                cam = compute_gradcam_pp(self.model, x, self.target_layer, class_idx=class_idx)
-                x.requires_grad_(False) # Detach
+                # 1. Compute Grad-CAM++ heatmap (requires gradients)
+                x_cam = x.clone().requires_grad_(True)
+                try:
+                    cam = compute_gradcam_pp(
+                        model=self.model,
+                        x=x_cam,
+                        target_layer=self.target_layer,
+                        class_idx=class_idx
+                    )
+                except Exception as e:
+                    logger.error(f"Grad-CAM failed for sample {seen}: {e}")
+                    seen += 1
+                    continue
 
-                # 2. Deletion-AUC
-                del_auc = compute_deletion_auc(
-                    model=self.model,
-                    x=x.detach(), # Use detached tensor
-                    cam=cam,
-                    class_idx=class_idx,
-                    device=self.device,
-                    steps=10,
-                )
-                del_aucs.append(del_auc)
-
-                # 3. Save overlays
-                if saved < save_k:
-                    save_gradcam_overlay(
+                # 2. Compute Deletion AUC (no gradients needed)
+                try:
+                    del_auc = compute_deletion_auc(
+                        model=self.model,
                         x=x.detach(),
                         cam=cam,
-                        out_dir=self.xai_dir,
-                        round_num=epoch, # Use round_num as epoch
-                        idx=seen,
-                        true_label=y_true,
-                        pred_label=pred_idx,
+                        class_idx=class_idx,
+                        device=self.device,
+                        steps=10,
                     )
-                    saved += 1
+                    del_aucs.append(del_auc)
+                except Exception as e:
+                    logger.error(f"Deletion AUC failed for sample {seen}: {e}")
+                    seen += 1
+                    continue
+
+                # 3. Save visualization
+                if saved < save_k:
+                    try:
+                        save_gradcam_overlay(
+                            x=x.detach(),
+                            cam=cam,
+                            out_dir=self.xai_dir,
+                            round_num=epoch,
+                            idx=seen,
+                            true_label=y_true,
+                            pred_label=pred_idx,
+                            auc=del_auc,
+                        )
+                        saved += 1
+                    except Exception as e:
+                        logger.error(f"Failed to save overlay for sample {seen}: {e}")
 
                 seen += 1
 
             if seen >= num_samples:
                 break
 
+        # Compute statistics
         if not del_aucs:
-            return {"val_del_auc_mean": float("nan"), "val_del_auc_std": float("nan")}
+            logger.warning("No valid XAI samples computed!")
+            return {
+                "xai_del_auc_mean": float("nan"),
+                "xai_del_auc_std": float("nan")
+            }
 
         arr = np.asarray(del_aucs, dtype=float)
         metrics = {
-            "val_del_auc_mean": float(arr.mean()),
-            "val_del_auc_std": float(arr.std()),
+            "xai_del_auc_mean": float(arr.mean()),
+            "xai_del_auc_std": float(arr.std()),
         }
-        logger.info(f"XAI Probe (Round {epoch}): Deletion AUC Mean={metrics['val_del_auc_mean']:.4f} Std={metrics['val_del_auc_std']:.4f}")
+        
+        # Add interpretive feedback
+        if metrics['xai_del_auc_mean'] < 0.4:
+            quality = "Good"
+        elif metrics['xai_del_auc_mean'] < 0.6:
+            quality = "Moderate"
+        else:
+            quality = "Poor"
+        
+        logger.info(
+            f"XAI Probe (Round {epoch}): "
+            f"Deletion AUC Mean={metrics['xai_del_auc_mean']:.4f} "
+            f"(±{metrics['xai_del_auc_std']:.4f}) "
+            f"[n={len(del_aucs)} samples] "
+            f"{quality}"
+        )
+        
         return metrics
 
 
-def create_client(client_id: int, data_dir: str, model_name: str = "customcnn",
-                  batch_size: int = 16, local_epochs: int = 50, num_workers: int = 1) -> MedicalFLClient:
+def create_client(
+    client_id: int,
+    data_dir: str,
+    model_name: str = "customcnn",
+    batch_size: int = 16,
+    local_epochs: int = 50,
+    num_workers: int = 1
+) -> MedicalFLClient:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
@@ -577,7 +641,7 @@ def run_flower(server_address: str, client: MedicalFLClient) -> None:
                 server_address=server_address,
                 client=client.to_client()
             )
-            break  # finished cleanly
+            break
         except grpc.RpcError as e:
             if e.code() == grpc.StatusCode.UNAVAILABLE:
                 logger.warning("Server UNAVAILABLE (gRPC 14). Reconnecting in 5s...")
@@ -588,11 +652,9 @@ def run_flower(server_address: str, client: MedicalFLClient) -> None:
 
 
 def main():
-    # Use spawn to avoid forking a multi-threaded process (Flower/gRPC)
     try:
         mp.set_start_method("spawn", force=True)
     except RuntimeError:
-        # Already set in this process
         pass
 
     _set_runtime_knobs(num_threads=4)
@@ -601,8 +663,8 @@ def main():
     parser.add_argument("--client-id", type=int, default=1, help="Client ID")
     parser.add_argument("--data-dir", type=str, required=True, help="Path to client data directory")
     parser.add_argument("--server-address", type=str, default="localhost:8080", help="FL server address")
-    parser.add.argument("--model", type=str, default="customcnn",
-                        choices=["mobilenetv3", "hybridmodel", "resnet50", "cnn", "hybridswin", "densenet121"],
+    parser.add_argument("--model", type=str, default="customcnn",
+                        choices=["mobilenetv3", "hybridmodel", "resnet50", "cnn", "hybridswin", "densenet121", "effnetb3", "effnetb4"],
                         help="Model architecture")
     parser.add_argument("--train-local", action="store_true", help="Run local training only (no FL server)")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size (CPU-only: 32 for ResNet/DenseNet, 64 for small CNN/EfficientNetB0)")
@@ -624,8 +686,8 @@ def main():
 
     if args.train_local:
         logger.info("Running standalone local training (no FL server)")
-        updated_params, num_examples, train_metrics = client.fit(client.get_parameters(), config={"server_round": 0})
-        test_loss, test_examples, test_metrics = client.evaluate(updated_params, config={"server_round": 0})
+        updated_params, num_examples, train_metrics = client.fit(client.get_parameters(), config={})
+        test_loss, test_examples, test_metrics = client.evaluate(updated_params, config={})
         logger.info("Local training and evaluation completed:")
         logger.info(f"  - Final train metrics: {train_metrics}")
         logger.info(f"  - Final test metrics:  {test_metrics}")
