@@ -702,7 +702,7 @@ def main():
     parser.add_argument("--fraction-evaluate", type=float, default=1.0)
     parser.add_argument("--model", type=str, default="densenet121", 
                         choices=["mobilenetv3", "hybridmodel", 
-                                 "resnet50", "cnn", "hybridswin", "densenet121", "effnetb3", "effnetb4"], help="Teacher model architecture")
+                                 "resnet50", "cnn", "HSwinDNMLP", "densenet121", "effnetb3", "effnetb4"], help="Teacher model architecture")
     parser.add_argument("--num-classes", type=int, default=4, help="Number of classes")
     parser.add_argument("--local-epochs", type=int, default=6)
     
