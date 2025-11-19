@@ -283,7 +283,7 @@ def run_xai_probe_gradcam_pp(
                     x=x,
                     cam=cam,
                     out_dir=xai_dir,
-                    epoch=epoch,
+                    round_num=epoch,
                     idx=seen,
                     true_label=y_true,
                     pred_label=pred_idx,
