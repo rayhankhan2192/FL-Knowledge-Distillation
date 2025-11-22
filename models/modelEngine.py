@@ -11,7 +11,7 @@ from models.efficientnet_medical import EfficientNetB3Medical, EfficientNetB4Med
 from models.ShuffleNetV2Student import ShuffleNetV2Student
 
 
-def get_model(model_name: str, num_classes: int, pretrained: bool = True, dropout_rate: float = 0.5):
+def get_model(model_name: str, num_classes: int, pretrained: bool = False, dropout_rate: float = 0.5):
     if model_name == 'HVTCMLP':
         model = HybridViTCNNMLP(
             num_classes=num_classes,
