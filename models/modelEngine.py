@@ -8,6 +8,7 @@ from models.mobilenetv3 import MobileNetV3
 from models.denseNet121 import DenseNet121Medical
 from models.HybridSwinDenseNetMLP import HybridSwinDenseNetMLP
 from models.efficientnet_medical import EfficientNetB3Medical, EfficientNetB4Medical
+from models.ShuffleNetV2Student import ShuffleNetV2Student
 
 
 def get_model(model_name: str, num_classes: int, pretrained: bool = True, dropout_rate: float = 0.5):
@@ -20,6 +21,13 @@ def get_model(model_name: str, num_classes: int, pretrained: bool = True, dropou
         )
     elif model_name == 'cnn':
         model = CustomCNN(num_classes=num_classes)
+    elif model_name == 'shufflenetv2':
+        model = ShuffleNetV2Student(
+            num_classes=num_classes,
+            in_channels=1,
+            pretrained=pretrained,
+            dropout_rate=dropout_rate
+        )
     elif model_name == 'mobilenetv3':
         model = MobileNetV3(
             num_classes=num_classes,
